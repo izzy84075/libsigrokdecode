@@ -61,7 +61,7 @@ ADDR_DP_CTRLSTAT = 0x4
 BIT_SELECT_CTRLSEL = 1
 BIT_CTRLSTAT_ORUNDETECT = 1
 
-ANNOTATIONS = ['bit', 'reset', 'enable', 'read', 'write', 'ack', 'data', 'parity', 'start', 'apndp', 'rnw', 'a', 'parity-bit', 'stop', 'park', 'trn', 'ack-bit', 'wdata', 'rdata']
+ANNOTATIONS = ['bit', 'reset', 'enable', 'read', 'write', 'ack', 'parity', 'wdata', 'rdata', 'start', 'apndp', 'rnw', 'a', 'parity-bit', 'stop', 'park', 'trn', 'ack-bit', 'idle', 'data']
 
 class Decoder(srd.Decoder):
     api_version = 3
@@ -93,8 +93,9 @@ class Decoder(srd.Decoder):
         ('read', 'READ'),
         ('write', 'WRITE'),
         ('ack', 'ACK'),
-        ('data', 'DATA'),
         ('parity', 'PARITY'),
+        ('wdata', 'WDATA'),
+        ('rdata', 'RDATA'),
         
         ('start', 'Start'),
         ('apndp', 'APnDP'),
@@ -105,13 +106,13 @@ class Decoder(srd.Decoder):
         ('park', 'Park'),
         ('trn', 'Trn'),
         ('ack-bit', 'Ack'),
-        ('wdata', 'WDATA'),
-        ('rdata', 'RDATA'),
+        ('data', 'DATA'),
+        ('idle', 'IDLE'),
     )
     annotation_rows = (
         ('bits', 'Bits', (0,)),
-        ('bit-meanings', 'Bit meanings', (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,)),
-        ('packets', 'Packets', (1, 2, 3, 4, 5, 6, 7,)),
+        ('bit-meanings', 'Bit meanings', (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,)),
+        ('packets', 'Packets', (1, 2, 3, 4, 5, 6, 7, 8,)),
     )
 
     def __init__(self):
@@ -233,6 +234,7 @@ class Decoder(srd.Decoder):
                     self.turnaround -= 1
                     self.putbit_turnaround()
                     self.putbitmeaning_host('trn', 0, 0, 'Turnaround')
+                    self.samplenums = [];
                     self.bits = ''
                     self.bits_target = ''
                     continue
@@ -241,7 +243,7 @@ class Decoder(srd.Decoder):
 
             # Otherwise, we only care about either rising or falling edges
             # (depending on sample_edge, set according to current state).
-            if clk != self.sample_edge:
+            if clk != FALLING:
                 continue
 
             {
@@ -264,11 +266,11 @@ class Decoder(srd.Decoder):
             self.turnaround = 0
         elif self.state == 'REQ':
             self.state = 'ACK'
-            self.sample_edge = FALLING
+            self.sample_edge = RISING
             self.turnaround = self.turnaround_bits
         elif self.state == 'ACK':
             self.state = 'DATA'
-            self.sample_edge = RISING if self.rw == 'W' else FALLING
+            self.sample_edge = RISING if self.rw == 'W' else RISING
             self.turnaround = 0 if self.rw == 'R' else self.turnaround_bits
         elif self.state == 'DATA':
             self.state = 'DPARITY'
@@ -276,7 +278,7 @@ class Decoder(srd.Decoder):
             self.put_python_data()
             self.state = 'REQ'
             self.sample_edge = RISING
-            self.turnaround = self.turnaround_bits if self.rw == 'R' else 0
+            self.turnaround = (self.turnaround_bits + 2) if self.rw == 'R' else 0
 
     def reset_state(self):
         '''Line reset (or equivalent), wait for a new pending SWD request.'''
@@ -318,21 +320,21 @@ class Decoder(srd.Decoder):
             self.rw = 'R' if m.group('rw') == '1' else 'W'
             self.apdp = 'AP' if m.group('apdp') == '1' else 'DP'
             self.addr = int(m.group('addr')[::-1], 2) << 2
-            parity_valid = 'Valid Parity' if parity == '' else 'Invalid Parity'
+            parity_valid = 'Valid' if parity == '' else 'Invalid'
+            
+            self.putbitmeaning_host('idle', 0, -9, "Idle")
             
             self.putbitmeaning_host('start', -8, -8, "Start")
             self.putbitmeaning_host('apndp', -7, -7, self.apdp)
             self.putbitmeaning_host('rnw', -6, -6, self.rw)
             self.putbitmeaning_host('a', -5, -4, self.apdp + " register address: " + str(self.addr) + " (" + self.get_address_description() + ")")
-            self.putbitmeaning_host('parity-bit', -3, -3, parity_valid)
+            self.putbitmeaning_host('parity-bit', -3, -3, "Parity (" + parity_valid + ")")
             self.putbitmeaning_host('stop', -2, -2, "Stop")
             self.putbitmeaning_host('park', -1, -1, "Park")
             #self.putbitmeaning('trn', len(self.samplenums)-1, len(self.samplenums)-1, "Turnaround")
             
-            self.putx('read' if self.rw == 'R' else 'write', 8, self.get_operation_summary())
+            self.putx('read' if self.rw == 'R' else 'write', 8, "Host Req: " + self.get_operation_summary())
             self.next_state()
-            
-            self.samplenums = []
             return
 
     def handle_ack_edge(self):
@@ -340,14 +342,14 @@ class Decoder(srd.Decoder):
         if len(self.bits_target) < 3:
             return
         
-        self.putbitmeaning_target('ack-bit', -3, len(self.samplenums)-1, "ACK reply")
+        self.putx('ack', 3, "Target: ACK reply")
         
         if self.bits_target == '100':
-            self.putx('ack', 3, 'OK')
+            self.putbitmeaning_target('ack-bit', -3, -1, 'OK')
             self.ack = 'OK'
             self.next_state()
         elif self.bits_target == '001':
-            self.putx('ack', 3, 'FAULT')
+            self.putbitmeaning_target('ack-bit', -3, -1, 'FAULT')
             self.ack = 'FAULT'
             if self.orundetect == 1:
                 self.next_state()
@@ -355,7 +357,7 @@ class Decoder(srd.Decoder):
                 self.reset_state()
             self.turnaround = 1
         elif self.bits_target == '010':
-            self.putx('ack', 3, 'WAIT')
+            self.putbitmeaning_target('ack-bit', -3, -1, 'WAIT')
             self.ack = 'WAIT'
             if self.orundetect == 1:
                 self.next_state()
@@ -363,21 +365,22 @@ class Decoder(srd.Decoder):
                 self.reset_state()
             self.turnaround = 1
         elif self.bits_target == '111':
-            self.putx('ack', 3, 'NOREPLY')
+            self.putbitmeaning_target('ack-bit', -3, -1, 'NOREPLY')
             self.ack = 'NOREPLY'
             self.reset_state()
         else:
-            self.putx('ack', 3, 'ERROR')
+            self.putbitmeaning_target('ack-bit', -3, -1, 'ERROR')
             self.ack = 'ERROR'
             self.reset_state()
 
     def handle_data_edge(self):
         '''Clock edge in the DATA state (waiting for 32 bits to clock past).'''
-        if len(self.bits) < 32:
+        if len(self.bits) < 33:
             return
+            
         self.data = 0
         self.dparity = 0
-        
+        paritybit = 0
         
         if self.rw == 'R':
             for x in range(32):
@@ -385,27 +388,34 @@ class Decoder(srd.Decoder):
                     self.data += (1 << x)
                     self.dparity += 1
             self.dparity = self.dparity % 2
+            self.putx('rdata', 33, "Target: RDATA")
+            self.putbitmeaning_target('data', -33, -2, '0x%08x' % self.data)
+            paritybit = self.bits_target[32]
         else:
             for x in range(32):
                 if self.bits[x] == '1':
                     self.data += (1 << x)
                     self.dparity += 1
             self.dparity = self.dparity % 2
+            self.putx('wdata', 33, "Host: WDATA")
+            self.putbitmeaning_host('data', -33, -2, '0x%08x' % self.data)
+            paritybit = self.bits[32]
         
-        self.putbitmeaning_target('rdata', -32, -1, "RDATA")
-        self.putx('data', 32, '0x%08x' % self.data)
         
+        
+        if str(self.dparity) != paritybit:
+            self.putbitmeaning_target('parity-bit', -1, -1, "Parity (Invalid)") # PARITY ERROR
+        elif self.rw == 'W':
+            self.handle_completed_write()
+        else:
+            self.putbitmeaning_target('parity-bit', -1, -1, "Parity (Valid)")
+        
+        self.next_state()
         self.next_state()
 
     def handle_dparity_edge(self):
         '''Clock edge in the DPARITY state (clocking in parity bit).'''
-        self.putbitmeaning_target('parity-bit', -1, -1, "Data Parity")
-        if str(self.dparity) != self.bits:
-            self.putx('parity', 1, str(self.dparity) + self.bits) # PARITY ERROR
-        elif self.rw == 'W':
-            self.handle_completed_write()
-        else:
-            self.putx('parity', 1, "Parity Valid")
+        
         self.next_state()
 
     def handle_completed_write(self):
